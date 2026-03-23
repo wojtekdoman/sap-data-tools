@@ -1,8 +1,9 @@
-# SAP Business One — Praktyczny Przewodnik
+# SAP Business One — Praktyczny Przewodnik (sap-data-tools)
 
-> Skondensowana wiedza zebrana podczas pracy z konkretną instancją SAP B1.
+> Referencja dla projektu **sap-data-tools** — narzędzia do CRUD na danych SAP B1.
 > Zawiera dane połączeniowe, nazwy pól, UDF-y, mapowania, quirki i pitfalle.
-> Używaj tego pliku jako referencji przy każdym nowym projekcie łączącym się z tym SAP-em.
+> **Odczyty:** Service Layer lub bezpośrednio MSSQL przez SSH (sqlcmd).
+> **Zapisy/aktualizacje/usuwanie:** wyłącznie przez Service Layer (PATCH/POST/DELETE).
 
 ---
 
@@ -25,32 +26,103 @@
 15. [Obsługa błędów](#15-obsługa-błędów)
 16. [Krytyczne pułapki](#16-krytyczne-pułapki)
 17. [Endpointy Service Layer — referencja](#17-endpointy-service-layer--referencja)
-18. [Połączenie bezpośrednie z SQL Server](#18-połączenie-bezpośrednie-z-sql-server)
+18. [Bezpośredni dostęp do SQL Server](#18-bezpośredni-dostęp-do-sql-server)
 
 ---
 
 ## 1. Dane połączeniowe
 
-### Service Layer (OData REST API)
+### Architektura dostępu (projekt sap-data-tools)
 
 ```
-URL:          https://212.91.25.118:50000/b1s/v1
-Alt URL:      https://217.17.34.62:50000/b1s/v1   (ten sam serwer, ten sam cert "SBOSQL")
+┌─────────────────────────────┐
+│  LOKALNA MASZYNA            │
+│  (ten komputer)             │
+│                             │
+│  sap_client.py ─────────────┼──→ HTTPS ──→ Service Layer (port 50000)
+│  (requests, .env)           │              (CRUD: GET/POST/PATCH/DELETE)
+│                             │
+│  ssh sap-prod ──────────────┼──→ SSH ────→ sqlcmd na serwerze
+│  (szybkie odczyty SQL)      │              (SELECT only, read-only user)
+└─────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  SAP SERVER "SBOSQL" (Windows Server)                       │
+│                                                             │
+│  PRODUKCJA: 217.17.34.62  ← SSH alias: sap-prod            │
+│  BACKUP:    212.91.25.118 ← SSH alias: sap-backup          │
+│  SSH user:  Administrator, key: ~/.ssh/sap                  │
+│  Cert:      Self-signed "SBOSQL" (verify=false)             │
+│                                                             │
+│  ├── SAP B1 Service Layer  → port 50000 (HTTPS)            │
+│  ├── SQL Server (MSSQL)    → localhost                      │
+│  │   DB: SBO_DOMSON_PL                                      │
+│  │   User: sap_sync_reader (read-only)                      │
+│  │   Pass: w C:\SAPSync\.env na serwerze                    │
+│  └── SAP Sync Agent        → C:\SAPSync\ (background info) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Domyślnie pracujemy z serwerem PRODUKCYJNYM (217). Na backup (212) przełączamy się tylko na wyraźne polecenie.**
+
+### Service Layer (OData REST API) — POTWIERDZONE
+
+```
+URL PROD:     https://217.17.34.62:50000/b1s/v1    ← DOMYŚLNY, TESTOWANY, DZIAŁA
+URL BACKUP:   https://212.91.25.118:50000/b1s/v1   ← TESTOWANY, DZIAŁA
 CompanyDB:    SBO_DOMSON_PL
 UserName:     manager
 Password:     11011976
-SSL:          Self-signed cert — wymagane verify=false
+SSL:          Self-signed cert "SBOSQL" — wymagane verify=false
 ```
 
-### SQL Server (bezpośredni dostęp do bazy)
+Konfiguracja w `.env` — zmienna `SAP_SL_URL` wskazuje na aktywny serwer.
+
+**Status testów (2026-03-23):**
+- Login na 217.17.34.62 — działa ✓
+- GET /Orders na 217.17.34.62 — działa ✓
+- Login na 212.91.25.118 — działa ✓
+- SSH + sqlcmd na 217.17.34.62 — działa ✓
+
+### SQL Server (MSSQL) — dostęp przez SSH + sqlcmd
+
+W tym projekcie łączymy się z MSSQL **przez SSH** na serwer SAP, a tam wykonujemy sqlcmd:
+
+```bash
+# Szybki odczyt z bazy SAP:
+ssh sap-prod "sqlcmd -S localhost -d SBO_DOMSON_PL -U sap_sync_reader -P SapSyncR3ad2026 -Q \"SELECT ... \" -W"
+```
 
 ```
-Host:         SBOSQL (ten sam serwer co Service Layer)
+SSH alias:    sap-prod (217.17.34.62) / sap-backup (212.91.25.118)
+SSH user:     Administrator
+SSH key:      ~/.ssh/sap
+MSSQL user:   sap_sync_reader (read-only, SELECT only)
+MSSQL pass:   SapSyncR3ad2026
 Database:     SBO_DOMSON_PL
-Engine:       Microsoft SQL Server
+Flag -W:      trims trailing spaces
 ```
 
-Dostęp do SQL realizowany jest przez sync agenta (Python, `C:\SAPSync\sync_agent.py` na serwerze SAP) który replikuje dane do lokalnego PostgreSQL. Można też łączyć się bezpośrednio przez pyodbc/pymssql jeśli jest tunel SSH.
+**Użycie:** szybkie odczyty (SELECT) gdy Service Layer jest za wolny lub potrzebujemy JOINów.
+**Zapisy:** NIGDY przez SQL — zawsze Service Layer (PATCH/POST/DELETE).
+
+### SSH do serwerów SAP
+
+```
+# Produkcja (domyślny):
+Host:         sap-prod
+HostName:     217.17.34.62
+User:         Administrator
+Key:          ~/.ssh/sap (ED25519)
+
+# Backup (tylko na wyraźne polecenie):
+Host:         sap-backup
+HostName:     212.91.25.118
+User:         Administrator
+Key:          ~/.ssh/sap (ED25519)
+```
+
+Połączenie: `ssh sap-prod` lub `ssh sap-backup`
 
 ### Branches (BPL — Business Places)
 
@@ -97,25 +169,12 @@ POST /Logout
 
 Nieobowiązkowe — sesja i tak wygaśnie po 30 min.
 
-### Zabezpieczenie przed race condition
+### Sesja w sap_client.py
 
-Używaj `asyncio.Lock()` aby zapobiec równoczesnym loginom z wielu coroutines:
-
-```python
-self._session_lock = asyncio.Lock()
-
-async def _ensure_session(self):
-    async with self._session_lock:
-        if self._is_session_valid():
-            return
-        await self._login()
-```
-
-### Przechowywanie sesji w Redis (multi-instance)
-
-Dla wielu instancji aplikacji — cookies w Redis z TTL:
-- Klucz: `{app}:sap_session:{username}:{company_db}`
-- TTL: czas do wygaśnięcia minus bufor (np. 25 min)
+`SAPClient` (synchroniczny, `requests`) obsługuje sesję automatycznie:
+- Auto-login przy pierwszym requeście
+- Auto-retry na 401 (re-login + powtórzenie requestu)
+- Context manager: `with SAPClient() as sap:`
 
 ---
 
@@ -970,6 +1029,7 @@ Wszystkie UDF mają prefix `U_`. Nazwy są **case-sensitive** w Service Layer!
 | `U_OrdFreq` | int | Częstotliwość zamówień (dni) |
 | `U_OpInvAllow` | int | Dozwolone otwarte faktury |
 | `U_DunLevAllowed` | int | Dozwolony poziom monitów |
+| `U_PaymentStatus` | varchar | Status płatności |
 
 ### UDFs na CRD1 (Adresy BP)
 
@@ -989,6 +1049,8 @@ Wszystkie UDF mają prefix `U_`. Nazwy są **case-sensitive** w Service Layer!
 |-----|-----|---------------|
 | `U_CNCode` | varchar | Kod CN/HS (celny) — **CASE-SENSITIVE!** Dokładnie `U_CNCode` |
 | `U_Category` | varchar | Kategoria produktu (backslash-separated: `"Cakes\\Fondant"`) |
+| `U_ItemCat` | varchar | Kategoria pozycji |
+| `U_StoreTemp` | varchar | Temperatura przechowywania |
 
 Parsowanie kategorii:
 ```python
@@ -1002,23 +1064,43 @@ main_category = u_category.split("\\")[0] if u_category else None
 | `U_KSeFid` | varchar | Nr referencyjny KSeF (deduplikacja) |
 | `U_OrderType` | varchar | Klasyfikacja typu zamówienia |
 
-### UDFs na ORDR (Zamówienia sprzedaży — transport)
+### UDFs na ORDR (Zamówienia sprzedaży)
+
+**Pola ogólne:**
 
 | UDF | Typ | Przeznaczenie |
 |-----|-----|---------------|
-| `U_trtractor` | varchar | Nr rejestracyjny ciągnika (może mieć spacje → strip!) |
-| `U_trtrailer` | varchar | Nr rejestracyjny naczepy |
-| `U_trloadplace1` | varchar | Miejsce załadunku 1 |
-| `U_trloadplace2` | varchar | Miejsce załadunku 2 |
-| `U_trunloadingpl1` | varchar | Miejsce rozładunku 1 |
-| `U_trunloadingpl2` | varchar | Miejsce rozładunku 2 |
-| `U_trlodatepl1` | varchar | Data załadunku 1 |
-| `U_trlodatepl2` | varchar | Data załadunku 2 |
-| `U_trunlodatepl1` | varchar | Data rozładunku 1 |
-| `U_trunlodatepl2` | varchar | Data rozładunku 2 |
-| `U_trunlotime1` | varchar | Czas rozładunku 1 |
-| `U_trunlotime2` | varchar | Czas rozładunku 2 |
-| `U_trremarks` | varchar | Uwagi transportowe |
+| `U_OrderType` | varchar | Klasyfikacja typu zamówienia |
+| `U_CashColl` | varchar | Cash collection |
+| `U_RunNo` | varchar | Numer rundy |
+| `U_DelivOrder` | varchar | Kolejność dostawy |
+| `U_CustRemarks` | varchar | Uwagi klienta |
+| `U_DrivLon` | varchar | Kierowca London |
+| `U_DrivMid` | varchar | Kierowca Midlands |
+| `U_AddDrivLo` | varchar | Dodatkowy kierowca London |
+| `U_AddDrivMid` | varchar | Dodatkowy kierowca Midlands |
+| `U_VehReg` | varchar | Rejestracja pojazdu (London) |
+| `U_VehMid` | varchar | Rejestracja pojazdu (Midlands) |
+
+**Pola transportowe (prefix `U_TR`):**
+
+| UDF | Typ | Przeznaczenie |
+|-----|-----|---------------|
+| `U_TRTractor` | varchar | Nr rejestracyjny ciągnika (może mieć spacje → strip!) |
+| `U_TRTrailer` | varchar | Nr rejestracyjny naczepy |
+| `U_TRLoadPlace1` | varchar | Miejsce załadunku 1 |
+| `U_TRLoadPlace2` | varchar | Miejsce załadunku 2 |
+| `U_TRUnloadingPl1` | varchar | Miejsce rozładunku 1 |
+| `U_TRUnloadingPl2` | varchar | Miejsce rozładunku 2 |
+| `U_TRLoDatePl1` | varchar | Data załadunku 1 |
+| `U_TRLoDatePl2` | varchar | Data załadunku 2 |
+| `U_TRUnloDatePl1` | varchar | Data rozładunku 1 |
+| `U_TRUnloDatePl2` | varchar | Data rozładunku 2 |
+| `U_TRUnloTime1` | varchar | Czas rozładunku 1 |
+| `U_TRUnloTime2` | varchar | Czas rozładunku 2 |
+| `U_TRRemarks` | varchar | Uwagi transportowe |
+
+**UWAGA: Nazwy UDF w Service Layer PATCH są CASE-SENSITIVE! Lowercase (np. `U_trtractor`) jest cicho ignorowane — PATCH zwraca 204 ale nic nie zmienia. Zawsze używaj dokładnych nazw z tabeli powyżej.**
 
 ### UDFs na UDT @VEHLO (Pojazdy)
 
@@ -1027,14 +1109,15 @@ main_category = u_category.split("\\")[0] if u_category else None
 | `U_defdriver` | varchar | Domyślny kierowca (branch ogólny) |
 | `U_defdriverm` | varchar | Domyślny kierowca (**Midlands — inne pole!**) |
 
-### UDFs na Contact Employees
+### UDFs na OCPR (Contact Employees)
 
 | UDF | Typ | Przeznaczenie |
 |-----|-----|---------------|
 | `U_ConCity` | varchar | Miasto kontaktu |
 | `U_ConPostcode` | varchar | Kod pocztowy kontaktu |
 | `U_OfficerRole` | varchar | Rola (D=director, S=secretary) |
-| `U_AppointedOn` | varchar | Data powołania |
+| `U_ResignedOn` | varchar | Data rezygnacji |
+| `U_b2brole` | varchar | Rola B2B |
 
 ---
 
@@ -1231,15 +1314,28 @@ GET /U_VEHLO         # @VEHLO
 
 ---
 
-## 18. Połączenie bezpośrednie z SQL Server
+## 18. Bezpośredni dostęp do SQL Server
 
-### Sync Agent
+### Jak odpytywać bazę SAP z tego projektu
 
-Agent synchronizacji działa na serwerze SAP (`C:\SAPSync\sync_agent.py`):
-- Odczytuje z SQL Server bezpośrednio
-- Replikuje dane do PostgreSQL
-- Sync co 15 minut (incremental) + on-demand
-- On-demand: tabela `sync_requests` w PostgreSQL
+```bash
+# Szablon — przez SSH na serwer SAP, potem sqlcmd:
+ssh sap-prod "sqlcmd -S localhost -d SBO_DOMSON_PL -U sap_sync_reader -P SapSyncR3ad2026 -Q \"TWOJE ZAPYTANIE SQL\" -W"
+
+# Przykład — ostatnie zamówienie:
+ssh sap-prod "sqlcmd -S localhost -d SBO_DOMSON_PL -U sap_sync_reader -P SapSyncR3ad2026 -Q \"SELECT TOP 1 DocEntry, DocNum, CardCode FROM ORDR ORDER BY DocEntry DESC\" -W"
+```
+
+**Kiedy SQL przez SSH zamiast Service Layer:**
+- JOINy między tabelami (SL nie wspiera JOINów)
+- Agregacje (COUNT, SUM, GROUP BY)
+- Szybkie sprawdzenie dużej ilości danych
+- Złożone filtrowanie (LIKE, IN, subqueries)
+
+**Kiedy Service Layer:**
+- Wszystkie zapisy (POST/PATCH/DELETE) — **ZAWSZE**
+- Proste odczyty pojedynczych rekordów
+- Gdy potrzebujesz zagnieżdżonych sub-kolekcji (DocumentLines, BPAddresses)
 
 ### Kluczowe różnice SQL Server vs Service Layer
 
@@ -1284,4 +1380,4 @@ HAVING COUNT(DISTINCT l.ItemCode) = 1  -- Tylko czyste zamówienia transportowe
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-23*
+*Ostatnia aktualizacja: 2026-03-23 — dostosowano do projektu sap-data-tools*
